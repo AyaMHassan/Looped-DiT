@@ -1,0 +1,66 @@
+# Looped-DiT B/16 on FFHQ 512x512, trained from scratch, unconditional (constant caption).
+# Data:  python tools/prepare_ffhq.py --images <FFHQ images> --out ${DATA_ROOT}/ffhq512_chunks \
+#            --image-size 512 --chunk-size 512 [--mirror]
+#        python tools/prepare_fid_ref.py --chunks ${DATA_ROOT}/ffhq512_chunks --out ${DATA_ROOT}/ffhq512_fid --num 10000
+# Run:   --baseline or --mlmc (see README); sample with cfg_scale 1.
+
+# Architecture (as B/16; 512 px -> 32 x 32 = 1024 image tokens)
+image_size: 512
+patch_size: 16
+hidden_size: 768
+num_heads: 12
+head_dim: 64
+mlp_ratio: 2.6667
+pca_channels: 128
+text_preamble_depth: 2
+loop_split: [6, 5, 6]                  # pre-loop / looped / post-loop blocks
+
+# Looped-DiT components
+num_loops: 4
+share_loop_weights: true
+deep_supervision: true
+deep_supervision_weighting: final_plus_mean
+use_xsa: true
+use_attn_gate: false
+
+# Constant caption: a short prompt keeps the joint attention sequence small
+prompt_length: 16
+
+# Data
+dataset: chunks
+chunk_dirs:
+  - ${DATA_ROOT}/ffhq512_chunks
+shuffle_buffer: 2048                   # 512 px samples are 4x bigger than at 256 px
+
+# Optimization (not tuned for FFHQ: batch 256 with the learning rate scaled down from B/16's 4e-4 at 1024)
+batch_size: 128
+micro_batch_size: 8                   # matching the batch size of the B/16 config
+num_steps: 100000
+warmup_steps: 2000
+learning_rate: 1.0e-4
+adam_beta2: 0.95
+weight_decay: 0.0
+max_grad_norm: 0.1
+ema_decay: 0.9999
+
+# Flow matching: noise scale 2.0 at 512 px (1.0 is for 256 px); no label dropout,
+# since there is nothing to guide toward
+noise_scale: 2.0
+t_logit_mean: -0.8
+t_logit_std: 0.8
+label_drop_rate: 0.0
+
+# Logging, samples and FID (the prepare_fid_ref.py output; 5k images for the periodic check,
+# raise fid_num_images to 50000 for a number comparable with the literature)
+log_every: 100
+sample_every: 5000
+sample_cfg_scale: 1.0
+ckpt_every: 10000
+ckpt_keep_every: 50000
+fid_every: 10000
+fid_num_images: 5000
+fid_prompts: ${DATA_ROOT}/ffhq512_fid/prompts.txt
+fid_ref_dir: ${DATA_ROOT}/ffhq512_fid/images
+fid_steps: 50
+fid_cfg_scale: 1.0
+fid_batch_size: 16

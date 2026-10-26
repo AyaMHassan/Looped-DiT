@@ -1,0 +1,67 @@
+# Looped-DiT B/16 on ImageNet 256x256, trained from scratch, class-conditional.
+# Data:  sbatch prepare_imagenet.sh /path/to/imagenet
+#        writes ${DATA_ROOT}/imagenet256_chunks and ${DATA_ROOT}/imagenet256_fid/{stats.npz,prompts.txt}
+#        (captions are "a photo of a {class}"; prompt_length below must match the chunks)
+# Run:   --baseline or --mlmc (see README); sample with cfg_scale 6.
+
+# Architecture (as B/16; 256 px -> 16 x 16 = 256 image tokens)
+image_size: 256
+patch_size: 16
+hidden_size: 768
+num_heads: 12
+head_dim: 64
+mlp_ratio: 2.6667
+pca_channels: 128
+text_preamble_depth: 2
+loop_split: [6, 5, 6]                  # pre-loop / looped / post-loop blocks
+
+# Looped-DiT components
+num_loops: 4
+share_loop_weights: true
+deep_supervision: true
+deep_supervision_weighting: final_plus_mean
+use_xsa: true
+use_attn_gate: false
+
+# Class captions are short; 32 matches tools/prepare_imagenet.py
+prompt_length: 32
+
+# Data
+dataset: chunks
+chunk_dirs:
+  - ${DATA_ROOT}/imagenet256_chunks
+shuffle_buffer: 4096
+
+# Optimization. Batch 2048 at 256 px, learning rate scaled down from B/16's 4e-4 at batch 1024.
+batch_size: 1024
+micro_batch_size: 32
+diag_alloc_batch: 256
+num_steps: 500000
+warmup_steps: 5000
+learning_rate: 4.0e-4
+adam_beta2: 0.95
+weight_decay: 0.0
+max_grad_norm: 0.1
+ema_decay: 0.99995
+
+# Flow matching: noise scale 1.0 at 256 px (the default 2.0 is for 512 px).
+# Label dropout trains the unconditional branch used by classifier-free guidance.
+noise_scale: 1.0
+t_logit_mean: -0.8
+t_logit_std: 0.8
+label_drop_rate: 0.1
+
+# Logging, samples and FID. stats.npz is the Inception mean/covariance of the chunks.
+# 50000 images is 50 per class, cycling imagenet256_fid/prompts.txt.
+log_every: 100
+sample_every: 10000
+sample_cfg_scale: 6.0
+ckpt_every: 5000
+ckpt_keep_every: 50000
+fid_every: 5000
+fid_num_images: 5000
+fid_prompts: ${DATA_ROOT}/imagenet256_fid/prompts.txt
+fid_stats: ${DATA_ROOT}/imagenet256_fid/stats.npz
+fid_steps: 100
+fid_cfg_scale: 6.0
+fid_batch_size: 64

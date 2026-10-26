@@ -154,11 +154,11 @@ def collate(batch: list[dict]) -> dict[str, torch.Tensor]:
     return {key: torch.stack([sample[key] for sample in batch]) for key in ("pixel_values", "input_ids", "attention_mask")}
 
 
-def make_loader(cfg: TrainConfig, seed_offset: int = 0) -> DataLoader:
+def make_loader(cfg: TrainConfig, seed_offset: int = 0, batch_size: int | None = None) -> DataLoader:
     stream = ChunkStream if cfg.dataset == "chunks" else WebDatasetMix
     return DataLoader(
         stream(cfg, seed_offset),
-        batch_size=cfg.micro_batch_size,
+        batch_size=batch_size or cfg.micro_batch_size,
         num_workers=cfg.num_workers,
         collate_fn=collate,
         pin_memory=True,
@@ -166,3 +166,16 @@ def make_loader(cfg: TrainConfig, seed_offset: int = 0) -> DataLoader:
         persistent_workers=cfg.num_workers > 0,
         prefetch_factor=cfg.prefetch_factor if cfg.num_workers > 0 else None,
     )
+
+
+def make_packed_loader(cfg: TrainConfig, level_sizes: list[int], seed_offset: int = 0) -> DataLoader:
+    """Loader for --mlmc training: every batch packs the samples of all MLMC levels.
+
+    A batch holds sum(level_sizes) samples; level k owns the next level_sizes[k-1] of
+    them, in level order (level 1 first), and mlmc_training_loss splits it the same way.
+    The streams shuffle i.i.d., so the slices are independent samples, as the telescope
+    needs. cfg.micro_batch_size is not used.
+    """
+    if not level_sizes or min(level_sizes) < 1:
+        raise ValueError(f"every level needs at least one sample, got {level_sizes}")
+    return make_loader(cfg, seed_offset, batch_size=sum(level_sizes))
