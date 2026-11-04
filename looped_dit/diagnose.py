@@ -33,7 +33,7 @@ import torch
 import yaml
 
 from .config import TrainConfig
-from .diffusion import deep_supervision_weights, default_level_allocation, final_exit_weights, mlmc_level_weights
+from .diffusion import default_level_allocation, final_exit_weights, supervised_exit_weights, supervised_level_weights
 from .mlmc_diagnostics import (
     baseline_gradient_estimate,
     budget_sweep,
@@ -50,6 +50,7 @@ from .mlmc_diagnostics import (
     target_allocation,
     telescope_gradient_estimate,
     tile_batch,
+    timing_knee,
     peak_memory_gb,
     reset_peak_memory,
     time_packed_steps,
@@ -79,8 +80,8 @@ def diagnostic_weights(cfg: TrainConfig, objective: str) -> tuple[list[float], l
     if final:
         return (*final_exit_weights(cfg.num_loops), True)
     return (
-        deep_supervision_weights(cfg.num_loops, cfg.deep_supervision_weighting),
-        mlmc_level_weights(cfg.num_loops, cfg.deep_supervision_weighting),
+        supervised_exit_weights(cfg.num_loops, cfg.deep_supervision_weighting, cfg.deep_supervision_first_exit),
+        supervised_level_weights(cfg.num_loops, cfg.deep_supervision_weighting, cfg.deep_supervision_first_exit),
         False,
     )
 
@@ -119,6 +120,7 @@ def run_diagnostics(
     allocations: list[list[int]] | None = None,
     allocation_budgets: list[int] | None = None,
     ref_sweep: list[int] | None = None,
+    level_sweep: list[int] | None = None,
 ) -> dict:
     """Run the measurement `repeats` times on fresh replicate batches (costs are timed once and reused) and return
     the per-metric mean and standard deviation over the repeats, with the per-repeat reports."""
@@ -134,7 +136,7 @@ def run_diagnostics(
     block_costs = level_block_costs(pre, core, post, num_levels, base_depth, exit_weights)
     block_ref = reference_block_cost(pre, core, post, num_levels, exit_weights)
     # a final-exit-only telescope is also measured against the deep-supervised baseline objective (mlmc_diag/vs_deep/...)
-    deep_weights = deep_supervision_weights(num_levels, cfg.deep_supervision_weighting) if final_only else None
+    deep_weights = supervised_exit_weights(num_levels, cfg.deep_supervision_weighting, cfg.deep_supervision_first_exit) if final_only else None
     deep_block_ref = reference_block_cost(pre, core, post, num_levels, deep_weights) if final_only else None
     loss_kwargs = dict(
         noise_scale=cfg.noise_scale, t_logit_mean=cfg.t_logit_mean, t_logit_std=cfg.t_logit_std,
@@ -194,6 +196,26 @@ def run_diagnostics(
                 ref_rows.append({"reference": name, "prefix": prefix, "requested": size, "used": used, "ms_per_sample": ms,
                                  "step_ms": ms * used, "peak_gb": peak_memory_gb(device)})
         print("reference sweep done", flush=True)
+    level_rows = None
+    if level_sweep:  # every level (and the reference) timed at each size: where does the per-sample time level off?
+        params = [p for p in model.parameters() if p.requires_grad]
+        made = make_losses(model, level_weights, exit_weights, loss_kwargs, autocast, base_depth)
+        terms = [(f"level{d}", block_costs[j], (lambda n, d=d: made[0](d, tile_batch(first_batch, n))))
+                 for j, d in enumerate(depths)]
+        terms.append(("reference", block_ref, lambda n: made[1](tile_batch(first_batch, n))))
+        level_rows = []
+        for name, blocks, fn in terms:
+            rows = []
+            for size in sorted(level_sweep):
+                reset_peak_memory(device)
+                ms, used = time_per_sample_fit(fn, size, params, device, timing_reps)
+                rows.append({"term": name, "requested": size, "used": used, "ms_per_sample": ms, "block_cost": blocks,
+                             "peak_gb": peak_memory_gb(device)})
+            knee = timing_knee([r["used"] for r in rows], [r["ms_per_sample"] for r in rows])
+            for r in rows:
+                r["knee"] = knee
+            level_rows += rows
+        print("level sweep done", flush=True)
     table, result_target = None, None
     if allocations or allocation_budgets:  # real packed steps timed per allocation: time x variance against the baseline step
         params = [p for p in model.parameters() if p.requires_grad]
@@ -275,7 +297,7 @@ def run_diagnostics(
             del base_stats, tele_stats
         print("validation done", flush=True)
     return {"mean": mean, "std": std, "median": median, "reports": reports, "budget_sweep": sweep, "validation": validation,
-            "allocation_table": table, "target_table": result_target, "ref_sweep": ref_rows,
+            "allocation_table": table, "target_table": result_target, "ref_sweep": ref_rows, "level_sweep": level_rows,
             "max_forward_batch": max_forward_batch, "depths": depths, "base_depth": base_depth,
             "final_exit_only": final_only, "replicates": replicates, "repeats": repeats,
             "alloc_batch": alloc_batch, "ref_batch": ref_batch}
@@ -334,6 +356,29 @@ def print_ref_sweep(result: dict) -> None:
     for r in rows:
         print(f"  {r['reference']:<9} {r['requested']:>6} {r['used']:>7} {r['ms_per_sample']:>10.2f} {r['step_ms']:>9.1f} "
               f"{r['peak_gb']:>8.1f}")
+
+
+def print_level_sweep(result: dict) -> None:
+    rows = result.get("level_sweep")
+    if not rows:
+        return
+    ref = {r["used"]: r["ms_per_sample"] for r in rows if r["term"] == "reference"}
+    print("\nLevel timing sweep: forward + backward of each level term at several batch sizes. 'call ms' is the time of one call, "
+          "'x flat' its ratio to the fastest call of the same term: while it stays near 1 the call is launch/overhead-bound and "
+          "extra samples are free. 'free up to' is the largest size within 10% of the fastest call: a floor for that level's "
+          "chunk. 'meas ratio' is ms/sample against the reference at the largest size it ran; 'blocks' is the block-count "
+          "ratio. 'ran at' below 'asked' means out of memory (batch halved).")
+    ref_best = ref[max(ref)] if ref else float("nan")
+    terms = list(dict.fromkeys(r["term"] for r in rows))
+    for term in terms:
+        mine = [r for r in rows if r["term"] == term]
+        flat = min(r["ms_per_sample"] * r["used"] for r in mine)
+        print(f"  {term}   free up to {mine[0]['knee']}   blocks ratio {mine[0]['block_cost'] / next(r for r in rows if r['term'] == 'reference')['block_cost']:.2f}")
+        print(f"    {'asked':>6} {'ran at':>7} {'ms/sample':>10} {'call ms':>8} {'x flat':>7} {'meas ratio':>11} {'peak GB':>8}")
+        for r in mine:
+            print(f"    {r['requested']:>6} {r['used']:>7} {r['ms_per_sample']:>10.2f} {r['ms_per_sample'] * r['used']:>8.1f} "
+                  f"{r['ms_per_sample'] * r['used'] / flat:>7.2f} "
+                  f"{r['ms_per_sample'] / ref_best:>11.2f} {r['peak_gb']:>8.1f}")
 
 
 def print_allocation_table(result: dict) -> None:
@@ -421,6 +466,10 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--ref-sweep", type=int, nargs="+", metavar="N",
                         help="time the baseline loss at each of these micro-batch sizes (does it fit, ms per sample, peak memory) and "
                              "give every --allocation's efficiency against the baseline at each size that fit, e.g. 32 64 96 128")
+    parser.add_argument("--level-sweep", type=int, nargs="+", metavar="N",
+                        help="time every level term and the reference at each of these batch sizes (ms per sample) and report the knee "
+                             "of each curve: the chunk size below which a level is overhead-dominated, e.g. 4 8 16 24 32 48 64. "
+                             "Use --repeats 1 --replicates 2 to skip most of the variance measurement")
     parser.add_argument("--seed", type=int, default=0)
     parser.add_argument("--text-encoder", help="override the text encoder path from the checkpoint")
     parser.add_argument("--set", nargs="*", default=[], metavar="KEY=VALUE", help="override config values, e.g. data paths")
@@ -457,17 +506,18 @@ def main(argv: list[str] | None = None) -> None:
                              args.budgets, args.max_forward_batch, args.sweep_iters, not args.no_common_noise,
                              args.validate, args.validate_estimates,
                              [[int(x) for x in a.split(",")] for a in args.allocation or []], args.allocation_budgets,
-                             args.ref_sweep)
+                             args.ref_sweep, args.level_sweep)
     print_summary(result)
     print_sweep(result)
     print_ref_sweep(result)
+    print_level_sweep(result)
     print_allocation_table(result)
     print_target_table(result)
     print_validation(result)
     result["checkpoint"] = str(args.checkpoint)
     result["reports"] = [{k: (None if isinstance(v, float) and not math.isfinite(v) else v) for k, v in r.items()}
                          for r in result["reports"]]
-    for row in (result["budget_sweep"] or []) + (result["validation"] or []) + (result["allocation_table"] or []) + (result["target_table"] or []) + (result["ref_sweep"] or []):
+    for row in (result["budget_sweep"] or []) + (result["validation"] or []) + (result["allocation_table"] or []) + (result["target_table"] or []) + (result["ref_sweep"] or []) + (result["level_sweep"] or []):
         for k, v in row.items():
             if isinstance(v, float) and not math.isfinite(v):
                 row[k] = None

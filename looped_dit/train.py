@@ -41,12 +41,12 @@ from .diffusion import (
     MLMCChunkObjective,
     MLMCObjective,
     corrupt,
-    deep_supervision_weights,
+    supervised_exit_weights,
+    supervised_level_weights,
     default_level_allocation,
     mlmc_chunk_plan,
     final_exit_weights,
     euler_sample,
-    mlmc_level_weights,
     training_loss,
 )
 from .fid import check_fid_setup, run_fid
@@ -216,13 +216,14 @@ def main() -> None:
         t_logit_std=cfg.t_logit_std,
         label_drop_rate=cfg.label_drop_rate,
     )
-    exit_weights = deep_supervision_weights(cfg.num_loops, cfg.deep_supervision_weighting) if cfg.deep_supervision else None
+    first_exit = cfg.deep_supervision_first_exit
+    exit_weights = supervised_exit_weights(cfg.num_loops, cfg.deep_supervision_weighting, first_exit) if cfg.deep_supervision else None
     if mlmc:
         # One module = one forward per micro-batch, which DDP requires; it wraps the same parameters.
         # deep_supervision false: the final-only telescope F_1 + sum_k (F_k - S_{k-1}) = F_K, every weight 1
         if cfg.deep_supervision:
-            level_weights = mlmc_level_weights(cfg.mlmc_levels, cfg.deep_supervision_weighting)
-            mlmc_exit_weights = deep_supervision_weights(cfg.mlmc_levels, cfg.deep_supervision_weighting)
+            level_weights = supervised_level_weights(cfg.mlmc_levels, cfg.deep_supervision_weighting, first_exit)
+            mlmc_exit_weights = supervised_exit_weights(cfg.mlmc_levels, cfg.deep_supervision_weighting, first_exit)
         else:
             mlmc_exit_weights, level_weights = final_exit_weights(cfg.mlmc_levels)
         if level_wise:  # one module per chunk: DDP sees one forward per backward, the step syncs on the last chunk
@@ -261,17 +262,18 @@ def main() -> None:
     if diag_final_only:  # no deep supervision: only the final exit has weight, so every telescope weight is 1
         diag_exit_weights, diag_level_weights = final_exit_weights(num_levels)
     else:
-        diag_level_weights = mlmc_level_weights(num_levels, cfg.deep_supervision_weighting)
-        diag_exit_weights = deep_supervision_weights(num_levels, cfg.deep_supervision_weighting)
+        diag_level_weights = supervised_level_weights(num_levels, cfg.deep_supervision_weighting, first_exit)
+        diag_exit_weights = supervised_exit_weights(num_levels, cfg.deep_supervision_weighting, first_exit)
     block_costs = level_block_costs(pre, core, post, num_levels, base_depth, diag_exit_weights)
     block_ref = reference_block_cost(pre, core, post, num_levels, diag_exit_weights)
     # A final-exit-only telescope is also measured against the deep-supervised baseline objective (mlmc_diag/vs_deep/...).
-    deep_ref_weights = deep_supervision_weights(num_levels, cfg.deep_supervision_weighting) if diag_final_only else None
+    deep_ref_weights = supervised_exit_weights(num_levels, cfg.deep_supervision_weighting, first_exit) if diag_final_only else None
     deep_block_ref = reference_block_cost(pre, core, post, num_levels, deep_ref_weights) if diag_final_only else None
     if mlmc:
         blocks_per_sample = sum(n * c for n, c in zip(cfg.mlmc_batch, block_costs)) / sum(cfg.mlmc_batch)
     else:
-        blocks_per_sample = baseline_block_cost(pre, core, post, cfg.num_loops, cfg.deep_supervision)
+        blocks_per_sample = (reference_block_cost(pre, core, post, cfg.num_loops, exit_weights) if exit_weights is not None
+                             else baseline_block_cost(pre, core, post, cfg.num_loops, False))
     diag_on = bool(cfg.diag_every) and num_levels >= 2
     # Costs are timed at the batch sizes a training step really runs. --mlmc: each level at its packed micro-batch share
     # (mlmc_batch). --baseline has no allocation: each level at the equal-cost optimal N_k, i.e. the samples that
@@ -413,7 +415,8 @@ def main() -> None:
                              or cfg.diag_cost_every == 0 or step % cfg.diag_cost_every == 0)
                 meas = measure(model, replicates, diag_level_weights, diag_exit_weights, loss_kwargs, device, autocast,
                                timing_sizes, ref_batch, cost_cache=None if costs_due else diag_cost_cache, base_depth=base_depth,
-                               common_noise=cfg.diag_common_noise, deep_exit_weights=deep_ref_weights, max_chunk=max_chunk)
+                               common_noise=cfg.diag_common_noise, deep_exit_weights=deep_ref_weights, max_chunk=max_chunk,
+                               alloc_budget=None if mlmc or not cfg.diag_alloc_measured else alloc_batch)
                 if costs_due:
                     diag_cost_cache, diag_cost_step = meas.cost_cache(), step
                 if device.type == "cuda":

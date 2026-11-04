@@ -43,6 +43,21 @@ def deep_supervision_weights(num_loops: int, weighting: str) -> list[float]:
     return [w * scale for w in raw]
 
 
+def supervised_exit_weights(num_loops: int, weighting: str, first_exit: int = 1) -> list[float]:
+    """Exit weights (w_1, ..., w_N) of the deep supervision over the exits first_exit..N only: the weighting is that of
+    N - first_exit + 1 loops (so F_N + F_3 / 2 + F_2 / 2 for first_exit 2 at N = 4) and the exits below get weight 0.
+    first_exit 1 is deep_supervision_weights."""
+    if not 1 <= first_exit <= num_loops - 1:
+        raise ValueError(f"first_exit must lie in [1, num_loops - 1 = {num_loops - 1}], got {first_exit}")
+    return [0.0] * (first_exit - 1) + deep_supervision_weights(num_loops - first_exit + 1, weighting)
+
+
+def supervised_level_weights(num_loops: int, weighting: str, first_exit: int = 1) -> list[float]:
+    """Telescope weights (W_1, ..., W_N), the suffix sums of supervised_exit_weights (mlmc_level_weights for first_exit 1)."""
+    w = supervised_exit_weights(num_loops, weighting, first_exit)
+    return [sum(w[k:]) for k in range(num_loops)]
+
+
 def corrupt(
     images: torch.Tensor,
     text_mask: torch.Tensor,
@@ -99,12 +114,16 @@ def training_loss(
         return loss, {"loss": loss.detach()}
 
     num_loops = len(exit_weights)
-    final, exits = model(x_t, text, text_mask, exit_loops=tuple(range(1, num_loops)))
+    read = tuple(r for r in range(1, num_loops) if exit_weights[r - 1] != 0)  # exits without weight are not even decoded
+    if read:
+        final, exits = model(x_t, text, text_mask, exit_loops=read)
+    else:
+        final, exits = model(x_t, text, text_mask), {}
     loss_final = flow_loss(final)
-    exit_losses = [flow_loss(exits[r]) for r in range(1, num_loops)]
-    loss = exit_weights[-1] * loss_final + torch.stack([w * l for w, l in zip(exit_weights, exit_losses)]).sum()
+    exit_losses = {r: flow_loss(exits[r]) for r in read}
+    loss = exit_weights[-1] * loss_final + sum((exit_weights[r - 1] * l for r, l in exit_losses.items()), loss_final.new_zeros(()))
     metrics = {"loss": loss.detach(), "loss_final": loss_final.detach()}
-    metrics.update({f"loss_exit{r}": l.detach() for r, l in enumerate(exit_losses, start=1)})
+    metrics.update({f"loss_exit{r}": l.detach() for r, l in exit_losses.items()})
     return loss, metrics
 
 

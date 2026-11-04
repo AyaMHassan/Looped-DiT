@@ -36,7 +36,7 @@ batch_size: 256
 micro_batch_size: 32
 num_steps: 500000
 warmup_steps: 5000
-learning_rate: 2.0e-4
+learning_rate: 1.0e-4
 adam_beta2: 0.95
 weight_decay: 0.0
 max_grad_norm: 0.1

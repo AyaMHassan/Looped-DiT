@@ -314,6 +314,17 @@ def time_per_sample_fit(
             n //= 2
 
 
+def timing_knee(sizes: list[int], ms_per_sample: list[float], tolerance: float = 0.1) -> int | None:
+    """Largest timed size whose call (ms per sample x size) takes at most `tolerance` longer than the fastest call: while a
+    call's time is flat in the batch size it is launch/overhead-bound, so samples up to this size are free. Beyond it the
+    GPU is compute-bound and every sample costs full price. None when no size has a usable time."""
+    pts = [(n, n * t) for n, t in zip(sizes, ms_per_sample) if math.isfinite(t) and t > 0]
+    if not pts:
+        return None
+    fastest = min(t for _, t in pts)
+    return max(n for n, t in pts if t <= fastest * (1 + tolerance))
+
+
 def make_losses(
     model: nn.Module,
     level_weights: list[float],
@@ -498,6 +509,8 @@ def measure(
     common_noise: bool = True,
     deep_exit_weights: list[float] | None = None,
     max_chunk: list[int] | None = None,
+    alloc_budget: int | None = None,
+    alloc_iterations: int = 2,
 ) -> Measurements:
     """Measure V and C for every level term and for the baseline objective.
 
@@ -520,6 +533,12 @@ def measure(
     alloc_sizes, but each level is timed at its largest chunk, as it really runs, so the cost per sample is that of a
     chunk and a whole-step count too big for the GPU no longer forces a halving. Without it a level is timed at its
     whole count. Sizes default to the replicate batch size.
+    alloc_budget: the baseline batch whose measured compute (alloc_budget * C_ref_ms) the allocation spends. The sizes from
+    timing_sizes (block costs) are then only the starting point: the levels are timed at them, the budget is re-spent
+    with the timed costs (equal_cost_sizes), and the levels are re-timed at the new sizes until these stop moving by more
+    than 5% (at most alloc_iterations re-timings). The allocation is the last sizes timed, so costs and counts agree. With
+    cost_cache the allocation follows the current variances and the cached costs. The variances and the costs are pooled
+    over the ranks before they are used, so every rank derives the same allocation.
     """
     params = [p for p in model.parameters() if p.requires_grad]
     samples = batches[0][0].shape[0]
@@ -545,30 +564,54 @@ def measure(
         out.V_deep, out.grad_sq_deep, _ = replicate_gradient_variance(
             params, [with_seed(deep_loss(b), seeds[r], device) for r, b in enumerate(batches)], samples)
 
+    out.V = pool_mean(out.V, device)  # one allocation for all ranks, from the variances of all their data
+
+    def derive(C: list[float], C_ref: float) -> list[float] | None:
+        sizes = equal_cost_sizes(out.V, C, alloc_budget * C_ref) if alloc_budget else []
+        return [float(n) for n in sizes] or None
+
     if cost_cache is not None:
         out.C_ms, out.C_ref_ms = list(cost_cache.C_ms), cost_cache.C_ref_ms
         if deep_loss is not None:
             out.C_deep_ms = cost_cache.C_deep_ms
         out.timing_sizes, out.ref_batch = list(cost_cache.timing_sizes), cost_cache.ref_batch
         out.timing_wanted = list(cost_cache.timing_wanted or cost_cache.timing_sizes)
-        out.alloc_sizes = [float(n) for n in timing_sizes(out.V)] if callable(timing_sizes) else list(
-            cost_cache.alloc_sizes or cost_cache.timing_sizes)
+        out.alloc_sizes = derive(out.C_ms, out.C_ref_ms) or (
+            [float(n) for n in timing_sizes(out.V)] if callable(timing_sizes) else list(cost_cache.alloc_sizes or cost_cache.timing_sizes))
         return out
     sizes = list(timing_sizes(out.V)) if callable(timing_sizes) else list(timing_sizes or [samples] * num_levels)
-    wanted = [max(split_evenly(n, c)) for n, c in zip(sizes, max_chunk)] if max_chunk else list(sizes)
-    used = []
-    for j, depth in enumerate(depths):
-        ms, n = time_per_sample_fit(lambda n, depth=depth: level_loss(depth, tile_batch(batches[0], n)),
-                                    wanted[j], params, device, timing_reps)
-        out.C_ms.append(ms), used.append(float(n))
-    out.C_ref_ms, ref_used = time_per_sample_fit(lambda n: ref_loss(tile_batch(batches[0], n)),
-                                                 ref_batch or samples, params, device, timing_reps)
-    out.timing_sizes, out.ref_batch = used, float(ref_used)
-    out.alloc_sizes, out.timing_wanted = [float(n) for n in sizes], [float(n) for n in wanted]
+    ref_ms, ref_used = None, None
+    for it in range(alloc_iterations + 1):
+        wanted = [max(split_evenly(n, c)) for n, c in zip(sizes, max_chunk)] if max_chunk else list(sizes)
+        out.C_ms, used = [], []
+        for j, depth in enumerate(depths):
+            ms, n = time_per_sample_fit(lambda n, depth=depth: level_loss(depth, tile_batch(batches[0], n)),
+                                        wanted[j], params, device, timing_reps)
+            out.C_ms.append(ms), used.append(float(n))
+        if ref_ms is None:  # the reference does not depend on the allocation: timed once
+            ref_ms, ref_used = time_per_sample_fit(lambda n: ref_loss(tile_batch(batches[0], n)), ref_batch or samples, params, device, timing_reps)
+        pooled = pool_mean([*out.C_ms, ref_ms], device)
+        out.C_ms, ref_ms = pooled[:-1], pooled[-1]
+        out.timing_sizes, out.timing_wanted = used, [float(n) for n in wanted]
+        out.alloc_sizes = [float(n) for n in sizes]
+        new = derive(out.C_ms, ref_ms) if it < alloc_iterations else None
+        if new is None or all(abs(a - b) <= 0.05 * b for a, b in zip(new, sizes)):
+            break
+        sizes = [int(n) for n in new]
+    out.C_ref_ms, out.ref_batch = ref_ms, float(ref_used)
     if deep_loss is not None:
         out.C_deep_ms, _ = time_per_sample_fit(lambda n: deep_loss(tile_batch(batches[0], n)),
                                                ref_batch or samples, params, device, timing_reps)
     return out
+
+
+def pool_mean(values: list[float], device: torch.device) -> list[float]:
+    """Mean of `values` over the ranks (unchanged without torch.distributed). Collective."""
+    if not values or not (dist.is_available() and dist.is_initialized()):
+        return list(values)
+    t = torch.tensor(values, dtype=torch.float64, device=device)
+    dist.all_reduce(t)
+    return (t / dist.get_world_size()).tolist()
 
 
 def reduce_mean(meas: Measurements, num_levels: int, device: torch.device) -> Measurements:
@@ -675,8 +718,11 @@ def build_report(
             m[f"mlmc_diag/{tag}equal_cost/variance_gain"] = realized_gain(meas.V, C, n, meas.V_ref, C_ref)
         m["mlmc_diag/equal_cost/total_samples"] = float(sum(n))
         m["mlmc_diag/equal_cost/baseline_batch"] = float(budget_batch)
+        by_blocks = equal_cost_sizes(meas.V, block_costs, budget_batch * block_ref)  # what the block costs alone would allocate
         for lvl in range(k):
             m[f"mlmc_diag/level{depths[lvl]}/equal_cost_samples"] = n[lvl]
+            if by_blocks:
+                m[f"mlmc_diag/level{depths[lvl]}/equal_cost_samples_blocks"] = float(by_blocks[lvl])
     if deep_block_ref and math.isfinite(meas.V_deep):
         deep = "mlmc_diag/vs_deep"
         for tag, C, C_ref in (("", meas.C_ms, meas.C_deep_ms), ("blocks/", block_costs, deep_block_ref)):

@@ -6,8 +6,7 @@
 #SBATCH --mem=240G
 #SBATCH --time=01-00:00:00
 # The image's PyTorch (2.5.1 in jit.sqsh) supports <= sm_90 (Hopper): exclude Blackwell partitions.
-#SBATCH --partition=H200,H200-SDS,H100,RTXB6000,H100-PCI,H200-PCI
-#SBATCH --output=slurm_logs/looped_dit_%j.out
+#SBATCH --partition=L40S,A100-40GB,A100-80GB,A100-RP,A100-SDS
 #SBATCH --error=slurm_logs/looped_dit_%j.err
 
 # Usage (run `mkdir -p slurm_logs` once before the first sbatch):

@@ -69,6 +69,10 @@ class TrainConfig:
     share_loop_weights: bool = True  # False: separate core blocks per pass (the "deeper" baseline)
     deep_supervision: bool = True  # flow loss on every loop exit, not only the last
     deep_supervision_weighting: str = "final_plus_mean"  # final_plus_mean | exponential | uniform
+    # First supervised exit: the deep supervision covers the exits first_exit..num_loops only, with the weighting of that many
+    # loops (2 at 4 loops: F_4 + F_3/2 + F_2/2; 3: F_4 + F_3) and weight 0 below (not decoded). 1 = every exit. With --mlmc the
+    # telescope's top depth mlmc_levels takes the place of num_loops; mlmc_base_depth = first_exit is its natural base level.
+    deep_supervision_first_exit: int = 1
     use_xsa: bool = True  # exclusive self-attention in the looped blocks
     use_attn_gate: bool = False  # head-wise sigmoid attention gate in the looped blocks
 
@@ -146,6 +150,11 @@ class TrainConfig:
     # so the cost per sample is the one a level-wise step pays and a big whole-step count does not run out of memory.
     # False: each level is timed at its whole count in one forward.
     diag_level_chunks: bool = True
+    # --baseline diagnostics allocate the levels (mlmc_diag/level*/equal_cost_samples) from the block costs alone (False):
+    # the allocation is the same on every GPU and micro-batch. True: the levels are timed at the block allocation and the
+    # same compute is re-spent with the timed costs (twice at most); a small chunk's fixed per-call overhead then reads as
+    # a high per-sample cost and shrinks that level (level 4 feeds back on itself), so it is off by default.
+    diag_alloc_measured: bool = False
     diag_ema_decay: float = 0.8  # decay of the log-space moving average logged as mlmc_diag_ema/* (0 = off)
     # Telescope the --baseline diagnostics evaluate: depths diag_base_depth..num_loops. The default 1 is the full
     # 4-level telescope (levels 1, 2, 3, 4). 2 starts at 2 loops (levels 2, 3, 4): its base level runs 2 loops and
@@ -217,6 +226,10 @@ class TrainConfig:
             raise ValueError(f"deep_supervision_weighting must be one of {DEEP_SUPERVISION_WEIGHTINGS}")
         if self.deep_supervision and self.num_loops < 2:
             raise ValueError("deep_supervision needs num_loops >= 2 (it supervises the intermediate loops)")
+        if not 1 <= self.deep_supervision_first_exit <= max(1, self.num_loops - 1):
+            raise ValueError(f"deep_supervision_first_exit must lie in [1, num_loops - 1], got {self.deep_supervision_first_exit}")
+        if self.train_mode == "mlmc" and self.deep_supervision and self.deep_supervision_first_exit > self.num_mlmc_levels() - 1:
+            raise ValueError("deep_supervision_first_exit must be below mlmc_levels (the supervised exits are first_exit..mlmc_levels)")
         if self.train_mode not in ("baseline", "mlmc"):
             raise ValueError(f"train_mode must be 'baseline' or 'mlmc', got {self.train_mode!r}")
         if self.train_mode == "mlmc":
