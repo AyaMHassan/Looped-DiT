@@ -98,12 +98,42 @@ def realized_gain(V: list[float], C: list[float], n: list[float], V_ref: float, 
 
 def equal_cost_sizes(V: list[float], costs: list[float], budget: float) -> list[int]:
     """Samples per level that spend `budget` (in the units of `costs`) optimally: N_k = budget * sqrt(V_k / C_k) /
-    sum_j sqrt(V_j C_j), at least one per level. The variance of the estimator is then (sum_j sqrt(V_j C_j))^2 / budget,
-    and the units of V cancel. Returns an empty list when the inputs are unusable."""
+    sum_j sqrt(V_j C_j) (the variance is then (sum_j sqrt(V_j C_j))^2 / budget and the units of V cancel), made integer
+    without exceeding the budget. The continuous counts are rounded down with at least one sample per level; if that minimum
+    overspends, the levels where a sample costs the least variance per unit of cost are trimmed; the budget left is then
+    spent greedily on the level where one more sample cuts the variance most per unit of cost, V_k / (C_k N_k (N_k + 1)).
+    This is feasible and close to, not guaranteed to be, the integer optimum. A budget below sum_k C_k cannot pay for one
+    sample per level: that minimum is returned (and overspends). Returns an empty list when the inputs are unusable."""
     if not V or len(V) != len(costs) or not all(math.isfinite(x) and x > 0 for x in list(V) + list(costs) + [budget]):
         return []
     root = sum(math.sqrt(v * c) for v, c in zip(V, costs))
-    return [max(1, int(budget * math.sqrt(v / c) / root + 0.5)) for v, c in zip(V, costs)]
+    sizes = [max(1, int(budget * math.sqrt(v / c) / root)) for v, c in zip(V, costs)]
+    spent = sum(n * c for n, c in zip(sizes, costs))
+    while spent > budget:
+        trim = [k for k, n in enumerate(sizes) if n > 1]
+        if not trim:
+            return sizes
+        k = min(trim, key=lambda j: V[j] / (costs[j] * sizes[j] * (sizes[j] - 1)))
+        sizes[k] -= 1
+        spent -= costs[k]
+    while True:
+        add = [k for k, c in enumerate(costs) if spent + c <= budget]
+        if not add:
+            return sizes
+        k = max(add, key=lambda j: V[j] / (costs[j] * sizes[j] * (sizes[j] + 1)))
+        sizes[k] += 1
+        spent += costs[k]
+
+
+def fixed_variance_sizes(V: list[float], costs: list[float], target_variance: float) -> list[int]:
+    """Giles' allocation for a variance target (his Eq. 3.1 with the target variance eps^2/2 = target_variance, there is no
+    bias term to split it with): N_k = ceil(sqrt(V_k / C_k) * sum_j sqrt(V_j C_j) / target_variance). This is the
+    cheapest allocation whose variance sum_k V_k / N_k is at most the target; the ceiling keeps it below the target and gives
+    every level at least one sample. Returns an empty list when the inputs are unusable."""
+    if not V or len(V) != len(costs) or not all(math.isfinite(x) and x > 0 for x in list(V) + list(costs) + [target_variance]):
+        return []
+    root = sum(math.sqrt(v * c) for v, c in zip(V, costs))
+    return [max(1, math.ceil(math.sqrt(v / c) * root / target_variance)) for v, c in zip(V, costs)]
 
 
 def timing_sizes_from_variances(
@@ -388,8 +418,7 @@ def target_allocation(V: list[float], C: list[float], target_var: float, cap: in
     values = list(V) + list(C) + [target_var]
     if not V or len(V) != len(C) or not all(math.isfinite(x) and x > 0 for x in values):
         return None
-    scale = sum(math.sqrt(v * c) for v, c in zip(V, C)) / target_var
-    total = [max(1, math.ceil(scale * math.sqrt(v / c))) for v, c in zip(V, C)]
+    total = fixed_variance_sizes(V, C, target_var)
     a = micro_batches or max(1, math.ceil(sum(total) / cap))
     micro = [max(1, math.ceil(n / a)) for n in total]
     return a, micro, [a * n for n in micro]
@@ -723,6 +752,43 @@ def build_report(
             m[f"mlmc_diag/level{depths[lvl]}/equal_cost_samples"] = n[lvl]
             if by_blocks:
                 m[f"mlmc_diag/level{depths[lvl]}/equal_cost_samples_blocks"] = float(by_blocks[lvl])
+    if level_sizes is None and budget_batch and meas.V_ref > 0 and math.isfinite(meas.V_ref):
+        # Minimise the cost given the variance: the target is the baseline's own variance at its batch, V_ref / B, and the
+        # levels get Giles' allocation for it. Its cost against the baseline's is giles_root^2 (up to the ceiling).
+        section = "mlmc_diag/min_cost_given_variance"
+        target = meas.V_ref / budget_batch
+        m[f"{section}/baseline_batch"] = float(budget_batch)
+        m[f"{section}/target_variance"] = target
+        for tag, C, C_ref in (("", meas.C_ms, meas.C_ref_ms), ("blocks/", block_costs, block_ref)):
+            pre = f"{section}/{tag}"
+            n = fixed_variance_sizes(meas.V, C, target)
+            root = giles_root(meas.V, C, meas.V_ref, C_ref)
+            m[f"{pre}giles_root"] = root
+            m[f"{pre}ideal_speedup"] = 1.0 / root**2 if root > EPS else float("nan")
+            m[f"{pre}speedup_possible"] = float(root < 1.0) if math.isfinite(root) else 0.0
+            if n and C_ref > 0:
+                cost = sum(a * c for a, c in zip(n, C))
+                m[f"{pre}total_samples"] = float(sum(n))
+                m[f"{pre}cost_vs_baseline"] = cost / (budget_batch * C_ref)
+                m[f"{pre}achieved_variance_ratio"] = sum(v / a for v, a in zip(meas.V, n)) / target  # <= 1 by the ceiling
+                m[f"{pre}speedup"] = budget_batch * C_ref / cost  # the baseline's cost over the cost of matching its variance
+            alloc = giles_allocation(meas.V, C)
+            for lvl in range(k):
+                lp = f"{pre}level{depths[lvl]}"
+                if n:
+                    m[f"{lp}/samples"] = float(n[lvl])
+                m[f"{lp}/variance_ratio"] = meas.V[lvl] / meas.V_ref
+                m[f"{lp}/cost_ratio"] = C[lvl] / C_ref if C_ref > 0 else float("nan")
+                m[f"{lp}/giles_contribution"] = (
+                    math.sqrt(m[f"{lp}/variance_ratio"] * m[f"{lp}/cost_ratio"]) if C_ref > 0 and meas.V[lvl] >= 0 else float("nan")
+                )
+                m[f"{lp}/optimal_sample_fraction"] = alloc["sample_fraction"][lvl]
+                m[f"{lp}/optimal_work_share"] = alloc["work_share"][lvl]
+                if lvl >= 1:
+                    m[f"{lp}/variance_ratio_to_previous"] = meas.V[lvl] / meas.V[lvl - 1] if meas.V[lvl - 1] > 0 else float("nan")
+                    m[f"{lp}/cost_ratio_to_previous"] = C[lvl] / C[lvl - 1] if C[lvl - 1] > 0 else float("nan")
+            m[f"{pre}fit/beta"] = -log2_slope(levels, meas.V[1:])
+            m[f"{pre}fit/gamma"] = log2_slope(levels, C[1:])
     if deep_block_ref and math.isfinite(meas.V_deep):
         deep = "mlmc_diag/vs_deep"
         for tag, C, C_ref in (("", meas.C_ms, meas.C_deep_ms), ("blocks/", block_costs, deep_block_ref)):
@@ -789,7 +855,7 @@ class LogEma:
             previous = self.state.get(key)
             self.state[key] = math.log(value) if previous is None else self.decay * previous + (1 - self.decay) * math.log(value)
             out[key.replace("mlmc_diag/", "mlmc_diag_ema/", 1)] = math.exp(self.state[key])
-        for tag in ("", "blocks/", "vs_deep/", "vs_deep/blocks/"):
+        for tag in ("", "blocks/", "vs_deep/", "vs_deep/blocks/", "min_cost_given_variance/", "min_cost_given_variance/blocks/"):
             root = out.get(f"mlmc_diag_ema/{tag}giles_root")
             if root:
                 out[f"mlmc_diag_ema/{tag}ideal_speedup"] = 1.0 / root**2
